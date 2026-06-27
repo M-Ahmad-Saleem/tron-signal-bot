@@ -101,13 +101,24 @@ def should_send(state: dict, signal: str, confidence: int) -> bool:
     return True
 
 
-# ── Binance Data ──────────────────────────────────────────────────────────────
-BINANCE_BASE = "https://api.binance.com"
+# ── Data Fetching — Multi-source fallback ─────────────────────────────────────
+# Priority: Binance Global → Binance US → Bybit → KuCoin
+# Agar ek block ho toh automatically next try karta hai
+
+INTERVAL_MAP_BYBIT = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15,
+    "30m": 30, "1h": 60, "2h": 120, "4h": 240, "1d": "D"
+}
+INTERVAL_MAP_KUCOIN = {
+    "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min",
+    "30m": "30min", "1h": "1hour", "2h": "2hour", "4h": "4hour", "1d": "1day"
+}
 
 
-def fetch_klines(symbol, interval, limit=100) -> pd.DataFrame:
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=15)
+def _klines_binance(symbol, interval, limit) -> pd.DataFrame:
+    """Binance Global"""
+    url = "https://api.binance.com/api/v3/klines"
+    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=12)
     r.raise_for_status()
     df = pd.DataFrame(r.json(), columns=[
         "open_time","open","high","low","close","volume",
@@ -119,10 +130,135 @@ def fetch_klines(symbol, interval, limit=100) -> pd.DataFrame:
     return df
 
 
-def fetch_ticker(symbol) -> dict:
-    r = requests.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", params={"symbol": symbol}, timeout=15)
+def _klines_binance_us(symbol, interval, limit) -> pd.DataFrame:
+    """Binance US (different domain, less restricted)"""
+    url = "https://api.binance.us/api/v3/klines"
+    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=12)
     r.raise_for_status()
-    return r.json()
+    df = pd.DataFrame(r.json(), columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_vol","trades","taker_base","taker_quote","ignore"
+    ])
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    return df
+
+
+def _klines_bybit(symbol, interval, limit) -> pd.DataFrame:
+    """Bybit — globally accessible"""
+    iv = INTERVAL_MAP_BYBIT.get(interval, 15)
+    url = "https://api.bybit.com/v5/market/kline"
+    r = requests.get(url, params={
+        "category": "spot", "symbol": symbol,
+        "interval": str(iv), "limit": limit
+    }, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise ValueError(f"Bybit error: {data.get('retMsg')}")
+    rows = data["result"]["list"]
+    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","turnover"])
+    df = df.iloc[::-1].reset_index(drop=True)  # oldest first
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"].astype(float), unit="ms")
+    return df
+
+
+def _klines_kucoin(symbol, interval, limit) -> pd.DataFrame:
+    """KuCoin — globally accessible"""
+    # KuCoin symbol format: TRX-USDT
+    ks = symbol.replace("USDT", "-USDT").replace("BTC", "-BTC")
+    iv = INTERVAL_MAP_KUCOIN.get(interval, "15min")
+    url = "https://api.kucoin.com/api/v1/market/candles"
+    r = requests.get(url, params={"symbol": ks, "type": iv}, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "200000":
+        raise ValueError(f"KuCoin error: {data.get('msg')}")
+    rows = data["data"][-limit:]
+    rows = list(reversed(rows))  # oldest first
+    df = pd.DataFrame(rows, columns=["open_time","open","close","high","low","volume","turnover"])
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"].astype(float), unit="s")
+    return df
+
+
+def fetch_klines(symbol, interval, limit=100) -> pd.DataFrame:
+    """Try multiple exchanges until one works."""
+    sources = [
+        ("Binance Global", _klines_binance),
+        ("Binance US",     _klines_binance_us),
+        ("Bybit",          _klines_bybit),
+        ("KuCoin",         _klines_kucoin),
+    ]
+    last_err = None
+    for name, fn in sources:
+        try:
+            df = fn(symbol, interval, limit)
+            log.info(f"Data source: {name} ✓")
+            return df
+        except Exception as e:
+            log.warning(f"{name} failed: {e}")
+            last_err = e
+    raise RuntimeError(f"Sab data sources fail ho gaye. Last error: {last_err}")
+
+
+def fetch_ticker(symbol) -> dict:
+    """24h ticker — try Binance, fallback to Bybit, then KuCoin."""
+    # Binance Global
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
+                         params={"symbol": symbol}, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"Binance ticker failed: {e}")
+
+    # Binance US
+    try:
+        r = requests.get("https://api.binance.us/api/v3/ticker/24hr",
+                         params={"symbol": symbol}, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"Binance US ticker failed: {e}")
+
+    # Bybit fallback
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers",
+                         params={"category": "spot", "symbol": symbol}, timeout=12)
+        r.raise_for_status()
+        t = r.json()["result"]["list"][0]
+        return {
+            "lastPrice":          t.get("lastPrice", "0"),
+            "priceChangePercent": t.get("price24hPcnt", "0"),
+            "quoteVolume":        t.get("turnover24h", "0"),
+        }
+    except Exception as e:
+        log.warning(f"Bybit ticker failed: {e}")
+
+    # KuCoin fallback
+    try:
+        ks = symbol.replace("USDT", "-USDT")
+        r = requests.get(f"https://api.kucoin.com/api/v1/market/stats",
+                         params={"symbol": ks}, timeout=12)
+        r.raise_for_status()
+        t = r.json()["data"]
+        change_pct = float(t.get("changeRate", 0)) * 100
+        return {
+            "lastPrice":          str(t.get("last", "0")),
+            "priceChangePercent": str(round(change_pct, 2)),
+            "quoteVolume":        str(t.get("volValue", "0")),
+        }
+    except Exception as e:
+        log.warning(f"KuCoin ticker failed: {e}")
+
+    # Last resort — return dummy ticker so analysis can still run
+    log.warning("Ticker fetch failed from all sources — using dummy values")
+    return {"lastPrice": "0", "priceChangePercent": "0", "quoteVolume": "0"}
 
 
 # ── Technical Indicators ──────────────────────────────────────────────────────
